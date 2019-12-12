@@ -1,460 +1,763 @@
+//#define _GNU_SOURCE // Get access to asprintf
+//#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <string.h>
+
 #include "csapp.h"
-#include<errno.h>
-#include<fcntl.h>
-#include<stdlib.h>
-#include<stdio.h>
-#include<sys/epoll.h>
-#include<sys/socket.h>
-#include<string.h>
-#include"cache.h"
 
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
 
-/* $begin select */
+/* You won't lose style points for including this long line in your code */
+static const char *user_agent_hdr = "Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3";
+
 #define MAXEVENTS 64
 
-/* You won't lose style points for including this long line in your code */
-static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
+struct event_action;
 
+int handle_new_client(struct event_action *ea_in);
+int handle_receive_request(struct event_action *ea);
 
-void command(void);
-void interrupt_handler(int);
-int handle_client(int connfd);
-int handle_new_client(int listenfd);
-void write_log_entry(char* uri, size_t size);//, struct *sockaddr_storage addr);
-void handler(int connection_fd);
-void parse_uri(char *uri, char *hostname, char *path, int *port);
-void build_http_header(char *http_header, char *hostname, char *path, int port, rio_t *rio_client);
+typedef struct entry {
+    char* key;
+    char* value;
+    int size;
+    struct entry *next;
+} cache;
 
-CacheList* CACHE_LIST;
-size_t written = 0;
-FILE *log_file;
-
-struct event_action {
-	int (*callback)(int);
-	void *arg;
+struct requestInfo{
+    int valid;
+    char *host;
+    int port;
+    char *path;
+    char **headers;
 };
 
-int efd;
+struct responseInfo{
+    size_t size;
+    char *data;
+};
 
-int main(int argc, char **argv)
-{
-	int listenfd;
-	socklen_t clientlen;
-	struct sockaddr_storage clientaddr;
-	struct epoll_event event;
-	struct epoll_event *events;
-	int i;
-	//int len;
-	int *argptr;
-	struct event_action *ea;
+struct event_action {
+    int (*handler)(struct event_action *ea);
+    void *data ;
+    int fd;
+};
 
-	size_t n;
-	//char buf[MAXLINE];
+struct proxy_transaction {
+    struct requestInfo *request;
+    struct responseInfo *response;
 
-	if (argc != 2) {
-		fprintf(stderr, "usage: %s <port>\n", argv[0]);
-		exit(0);
-	}
+    char *buf;
+    size_t bufpos;
+    size_t buflen;
+    size_t bufmaxlen;
 
-	listenfd = Open_listenfd(argv[1]);
+    int clientfd;
+    int serverfd;
+};
 
-	// set fd to non-blocking (set flags while keeping existing flags)
-	if (fcntl(listenfd, F_SETFL, fcntl(listenfd, F_GETFL, 0) | O_NONBLOCK) < 0) {
-		fprintf(stderr, "error setting socket option\n");
-		exit(1);
-	}
+int lfd;
+int epfd;
+FILE *LOG;
 
-	//Step 1: create epoll instance
-	if ((efd = epoll_create1(0)) < 0) {
-		fprintf(stderr, "error creating epoll fd\n");
-		exit(1);
-	}
+int epoll_cnt = 0;
+int done = 0;
 
-	//Step 2: initialize cache.
-	CACHE_LIST = (CacheList*)malloc(sizeof(CacheList));
-  cache_init(CACHE_LIST);
-  signal(SIGINT, interrupt_handler);
-
-
-	ea = malloc(sizeof(struct event_action));
-	ea->callback = handle_new_client;
-	argptr = malloc(sizeof(int));
-	*argptr = listenfd;
-
-	ea->arg = argptr;
-	event.data.ptr = ea;
-	event.events = EPOLLIN | EPOLLET; // use edge-triggered monitoring
-	if (epoll_ctl(efd, EPOLL_CTL_ADD, listenfd, &event) < 0) {
-		fprintf(stderr, "error adding event\n");
-		exit(1);
-	}
-
-	/* Buffer where events are returned */
-	events = calloc(MAXEVENTS, sizeof(event));
-
-	while (1) {
-		// wait for event to happen (no timeout)
-		n = epoll_wait(efd, events, MAXEVENTS, -1);
-		//add checker for timeout and errors
-
-		for (i = 0; i < n; i++) {
-			ea = (struct event_action *)events[i].data.ptr;
-			argptr = ea->arg;
-			if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-				/* An error has occured on this fd */
-				fprintf (stderr, "epoll error on fd %d\n", *argptr);
-				close(*argptr);
-				free(ea->arg);
-				free(ea);
-				continue;
-			}
-
-			if (!ea->callback(*argptr)) {
-				close(*argptr);
-				free(ea->arg);
-				free(ea);
-			}
-
-		}
-	}
-	free(events);
+void sigint_handler(int signal){
+    done = 1;
 }
 
-int handle_new_client(int listenfd) {
-	printf("NEW CLIENT\n");
-	socklen_t clientlen;
-	int connfd;
-	struct sockaddr_storage clientaddr;
-	struct epoll_event event;
-	int *argptr;
-	struct event_action *ea;
-
-	clientlen = sizeof(struct sockaddr_storage);
-
-	// loop and get all the connections that are available
-	while ((connfd = accept(listenfd, (struct sockaddr *)&clientaddr, &clientlen)) > 0) {
-
-		// set fd to non-blocking (set flags while keeping existing flags)
-		if (fcntl(connfd, F_SETFL, fcntl(connfd, F_GETFL, 0) | O_NONBLOCK) < 0) {
-			fprintf(stderr, "error setting socket option\n");
-			exit(1);
-		}
-
-		ea = malloc(sizeof(struct event_action));
-		ea->callback = handle_client;
-		argptr = malloc(sizeof(int));
-		*argptr = connfd;
-
-		// add event to epoll file descriptor
-		ea->arg = argptr;
-		event.data.ptr = ea;
-		event.events = EPOLLIN | EPOLLET; // use edge-triggered monitoring
-		if (epoll_ctl(efd, EPOLL_CTL_ADD, connfd, &event) < 0) {
-			fprintf(stderr, "error adding event\n");
-			exit(1);
-		}
-	}
-
-	if (errno == EWOULDBLOCK || errno == EAGAIN) {
-		// no more clients to accept()
-		return 1;
-	} else {
-		perror("error accepting");
-		return 0;
-	}
-}
-
-
-int handle_client(int connection_fd) {
-
-	//printf("entered handle client\n");
-
-	int dest_server_fd;
-	char buf[MAXLINE];
-	memset(&buf[0], 0, sizeof(buf));
-	char usrbuf[MAXLINE];                                                       //Buffer to read from
-  char method[MAXLINE];                                                       //Method, should be "GET" we don't handle anything else
-  char uri[MAXLINE];                                                          //The address we are going to i.e(https://www.example.com/)
-  char version[MAXLINE];                                                      //Will be changing version to 1.0 always
-	char hostname[MAXLINE];                                                     //i.e. www.example.com
-	memset(&hostname[0], 0, sizeof(hostname));
-  char path[MAXLINE];                                                         //destinationin server i.e /home/index.html
-	memset(&path[0], 0, sizeof(path));
-  char http_header[MAXLINE];
-	//memset(&http_header[0], 0, sizeof(http_header));
-	//char* http_header = malloc(MAXLINE * sizeof(char));
-
-  int port;
-
-	rio_t rio_client;                                                           //Client rio_t
-  rio_t rio_server;                                                           //Server rio_t
-
-	Rio_readinitb(&rio_client, connection_fd);
-	Rio_readlineb(&rio_client, buf, MAXLINE);                                   //Read first line
-	sscanf(buf,"%s %s %s", method, uri, version);
-
-	if(strcasecmp(method, "GET")){                                              //If somethinge besides "GET", disregard
-			printf("Proxy server only implements GET method\n");
-			return;
-	}
-
-	//printf("URI: %s\n", uri);
-	//printf("VERSION: %s\n", version);
-	//printf("METHOD: %s\n", method);
-
-	//printf("Checking cache...\n");
-	//Check if request exists in cache
-	CachedItem* cached_item = find(buf, CACHE_LIST);
-	if(cached_item != NULL){
-		move_to_front(cached_item->url, CACHE_LIST);
-		size_t to_be_written = cached_item->size;
-		written = 0;
-		char* item_buf = cached_item->item_p;
-		while((written = rio_writen(connection_fd, item_buf, to_be_written)) != to_be_written){
-			item_buf += written;
-			to_be_written -= written;
-		}
-		return;
-	}
-
-	//printf("DNE in cache...\n");
-
-	/*  PARSE_URI
-	*   get the hostname
-	*   check if desired port is input or set to default port 80
-	*   get the path from URI
-	*/
-
-	memset(&path[0], 0, sizeof(path));                                          //Reset the memeory of path
-	memset(&hostname[0], 0, sizeof(hostname));                                  //Reset the memory of hostname
-	//memset(&uri[0], 0, sizeof(uri));
-
-	//Parse the URI to get hostname, path and port
-	//printf("PARSING URI...\n");
-  parse_uri(uri, hostname, path, &port);
-	//printf("DONE PARSING...\n");
-	//printf("PATH: %s\n", path);
-	//printf("PORT: %d\n", port);
-	//printf("HOSTNAME: %s\n", hostname);
-
-	//Build the http header from the parsed_uri to send to server
-	//printf("build_http_header\n");
-  build_http_header(http_header, hostname, path, port, &rio_client);
-	//printf("DONE WITH HEADER\n");
-  printf("%s\n", http_header);
-
-	//printf("ATTEMPTING CONNECTION TO DESTINATION SERVER\n");
-	//Establish connection to destination server
-  char port_string[100];
-  sprintf(port_string, "%d", port);
-  dest_server_fd = Open_clientfd(hostname, port_string);
-
-  if(dest_server_fd < 0){
-			printf("Connection to %s on port %d unsuccessful\n", hostname, port);
-      return;
-  }
-
-	printf("CONNECTED!\n");
-
-	//Send and receive info to and from destination server
-  Rio_readinitb(&rio_server, dest_server_fd);
-  rio_writen(dest_server_fd, http_header, sizeof(http_header));
-
-	printf("after writen\n");
-
-  size_t size = 0;
-  size_t total_bytes = 0;
-  char obj[MAX_OBJECT_SIZE];
-  while((size = rio_readlineb(&rio_server, usrbuf, MAXLINE)) != 0){
-					printf("size\n");
-          total_bytes += size;
-          rio_writen(connection_fd, usrbuf, size);
-          if(total_bytes < MAX_OBJECT_SIZE)
-            strcat(obj, usrbuf);
-  }
-
-	printf("buf: %s\n", buf);
-
-  if(total_bytes < MAX_OBJECT_SIZE){
-    char* to_be_cached = (char*) malloc(total_bytes);
-    strcpy(to_be_cached, obj);
-    cache_URL(buf, to_be_cached, total_bytes, CACHE_LIST);
-  }
-
-	printf("CACHED: %s\n", CACHE_LIST->first->url);
-
-	write_log_entry(buf, total_bytes);
-	//free(http_header);
-
-	// int len;
-	// while ((len = recv(connfd, buf, MAXLINE, 0)) > 0) {
-	// 	printf("Received %d bytes\n", len);
-	// 	send(connfd, buf, len, 0);
-	// }
-	// if (len == 0) {
-	// 	// EOF received.
-	// 	// Closing the fd will automatically unregister the fd
-	// 	// from the efd
-	// 	return 0;
-	// } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
-	// 	return 1;
-	// 	// no more data to read()
-	// } else {
-	// 	perror("error reading");
-	// 	return 0;
-	// }
-}
-
-void interrupt_handler(int num){
-    cache_destruct(CACHE_LIST);
-    free(CACHE_LIST);
-	//Will also need to free ea
-    exit(0);
-}
-
-void write_log_entry(char* uri, size_t size){//, struct sockaddr_storage *addr){
-
-	//Format current time string
-	time_t t;
-	char t_string[MAXLINE];
-	t = time(NULL);
-	strftime(t_string, MAXLINE, "%a %d %b %Y %H:%M %S %Z", localtime(&t));
-	//printf("time: %s\n", t_string);
-
-	//Open log.txt
-	//"a" - open for writing
-	log_file = fopen("log.txt", "a");
-	fprintf(log_file, "REQUEST ON: %s\n", t_string);
-	//fprintf(log_file, "FROM: %s\n", host);
-	fprintf(log_file, "URI: %s\n\n", uri);
-	fclose(log_file);
-
-}
-
-void parse_uri(char *uri, char *hostname, char *path, int *port){
-
-    char* sub_str1 = strstr(uri, "//");
-    char my_sub[MAXLINE];
-    memset(&my_sub[0], 0, sizeof(my_sub));
-    char* sub = my_sub;
-    char num[MAXLINE];
-    int hostname_set = 0;
-
-    *port = 80;                                                                 //Default port is 80
-
-    if(sub_str1 != NULL){
-        int i = 2;                                                              //advance past the '//'
-        int j = 0;
-        for(; i < strlen(sub_str1); i++)
-            sub[j++] = sub_str1[i];
+void free_requestInfo(void *info_v){
+    struct requestInfo *info = (struct requestInfo *)info_v;
+    if (info->host){
+        Free(info->host);
     }
-    //printf("sub: %s\n", sub);                                                 //sub contains everything after http://
-
-    /*  Check if colon exists in sub-string
-    *   if it exists, we have a designated port
-    *   else port is already set to default port 80
-    */
-    char* port_substring = strstr(sub, ":");
-    if(port_substring != NULL){
-        int x = 1;
-        int y = 0;
-        while(1){                                                               //Get port numbers
-            if(port_substring[x] == '/')
-                break;
-            num[y++] = port_substring[x++];
-        }
-        *port = atoi(num);                                                      //Set port
-
-        x = 0;
-        y = 0;
-        while(1){
-            if(sub[y] == ':')
-                break;
-            hostname[x++] = sub[y++];
-        }
-        hostname_set = 1;
+    if (info->path) {
+        Free(info->path);
     }
-    //printf("PORT: %d\n", *port);
+    if (info->headers) {
+        Free(info->headers);
+    }
+    Free(info);
+}
 
-    //Get Path
-    char *sub_path = strstr(sub, "/");
-    //printf("sub_path: %s\n", sub_path);
-    if(sub_path != NULL){
-        int a = 0;
-        int b = 0;
-        while(1){
-            if(sub_path[b] == '\0')
-                break;
-            path[a++] = sub_path[b++];
-        }
-        if(!hostname_set){                                                      //If the hostname is not set
-            a = 0;                                                              //Set it...
-            b = 0;
-            while(1){
-                if(sub[b] == '/')
-                    break;
-                hostname[a++] = sub[b++];
+void free_proxyTransaction(struct proxy_transaction *transaction){
+    if (transaction->clientfd) {
+        close(transaction->clientfd);
+    }
+    if (transaction->serverfd) {
+        close(transaction->serverfd);
+    }
+    if (transaction->buf) {
+        free(transaction->buf);
+    }
+    if (transaction->request) {
+        free_requestInfo(transaction->request);
+    }
+    free(transaction);
+}
+
+int main(int argc, char **argv){
+	signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
+	signal(SIGPIPE, SIG_IGN);
+
+	//socklen_t clientLen;
+    struct epoll_event event;
+    struct epoll_event *events;
+    int i;
+    struct event_action *ea;
+    size_t n;
+
+    LOG = fopen("LOGFile.txt", "a");
+
+    fprintf(LOG, "--- Begin Proxy Session at UNIX Time %ld ---", time(NULL));
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+        exit(0);
+    }
+
+    lfd = Open_listenfd(argv[1]);
+
+    // set fd to non-blocking (set flags while keeping existing flags)
+    if (fcntl(lfd, F_SETFL, fcntl(lfd, F_GETFL, 0) | O_NONBLOCK) < 0){
+        fprintf(stderr, "error setting socket stif\n");
+        exit(1);
+    }
+
+    if ((epfd = epoll_create1(0)) < 0){
+        fprintf(stderr, "error creating epoll fd\n");
+        exit(1);
+    }
+
+    ea = malloc(sizeof(struct event_action));
+    ea->handler = handle_new_client;
+    ea->fd = lfd;
+    ea->data = NULL;
+
+    event.data.ptr = ea;
+    event.events = EPOLLIN | EPOLLET; // edge-triggered monitoring
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &event) < 0){
+        fprintf(stderr, "error adding event\n");
+        exit(1);
+    }
+    fprintf(LOG, "line %d: registered %d\n", __LINE__, lfd);
+    epoll_cnt++;
+
+    /* Buffer where events are returned */
+    events = calloc(MAXEVENTS, sizeof(event));
+
+    while (epoll_cnt > 0){ //can't make timeout work. So waiting till no more events
+        n = epoll_wait(epfd, events, MAXEVENTS, -1);
+        if (done){
+            if (lfd != -1){
+                close(lfd);
+                lfd = -1;
+                epoll_cnt--;
+            }
+            if ((n == 0 || n == -1) && errno == EINTR) {
+                printf("Waiting for rest of connections to finish.\n");
             }
         }
-    }
-}
+        if (n == 0 || n == -1) {// size_t is unsigned, so -1 isn't actually < 0. Rip
+            continue;
+        }
 
-void build_http_header(char *http_header, char *hostname, char *path, int port, rio_t *rio_client){
+        for (i = 0; i < n; i++){ //iterate through events and handle them
+            struct event_action *ea2 = (struct event_action *)events[i].data.ptr;
+            if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+                /* An error has occured on this fd */
+                fprintf(stderr, "fd got issues %d\n", ea2->fd);
+                fprintf(stderr, "epoll: %s\n", strerror(errno));
+                if (ea2->data ){
+                    free_proxyTransaction((struct proxy_transaction *)ea2->data );
+                }
+                if (ea2->fd != -1){
+                    close(ea2->fd);
+                    epoll_cnt--;
+                }
+                free(ea2);
 
-    char buf[MAXLINE];
-    char request_header[MAXLINE];
-    char host_header[MAXLINE];
-    char other_headers[MAXLINE];
-
-    char *connection_header = "Connection: close\r\n";
-    char *prox_header = "Proxy-Connection: close\r\n";
-    char *host_header_format = "Host: %s\r\n";
-    char *request_header_format = "GET %s HTTP/1.0\r\n";
-    char *carriage_return = "\r\n";
-
-    char *connection_key = "Connection";
-    char *user_agent_key= "User-Agent";
-    char *proxy_connection_key = "Proxy-Connection";
-    char *host_key = "Host";
-
-    int connection_len = strlen(connection_key);
-    int user_len = strlen(user_agent_key);
-    int proxy_len = strlen(proxy_connection_key);
-    int host_len = strlen(host_key);
-
-    sprintf(request_header, request_header_format, path);
-
-    while(Rio_readlineb(rio_client, buf, MAXLINE) > 0){
-
-            //Check for EOF first
-            if(!strcmp(buf, carriage_return))
-                break;
-
-            //Check for host_key in buf
-            //strncasecmp is not case sensitive
-            //compares host_len chars in buf to host_key
-            if(!strncasecmp(buf, host_key, host_len)){
-                strcpy(host_header, buf);
                 continue;
             }
 
-            //Check for any headers that are other_headers
-            if( !strncasecmp(buf, connection_key, connection_len) &&
-                !strncasecmp(buf, proxy_connection_key, proxy_len) &&
-                !strncasecmp(buf, user_agent_key, user_len)){
-                    strcat(other_headers, buf);
+            if (!ea2->handler(ea2)){
+                if (ea2->data ) {
+                    free_proxyTransaction((struct proxy_transaction *)ea2->data );
                 }
+                if (ea2->fd != -1) {
+                    close(ea2->fd);
+                }
+                free(ea2);
+            }
+        }
+    }
+    free(ea);
+    free(events);
+}
+
+int handle_new_client(struct event_action *ea_in){
+    socklen_t clientLen;
+    int connfd;
+    struct sockaddr_storage clientaddr;
+    struct epoll_event event;
+    struct proxy_transaction *argptr;
+    struct event_action *ea;
+
+    clientLen = sizeof(struct sockaddr_storage);
+
+    // loop and get all available client connections
+    while ((connfd = accept(ea_in->fd, (struct sockaddr *)&clientaddr, &clientLen)) > 0) {
+
+        // set fd to non-blocking (set flags while keeping existing flags)
+        if (fcntl(connfd, F_SETFL, fcntl(connfd, F_GETFL, 0) | O_NONBLOCK) < 0) {
+            fprintf(stderr, "error setting socket option\n");
+            exit(1);
+        }
+
+        ea = malloc(sizeof(struct event_action));
+        ea->handler = handle_receive_request;
+        ea->fd = connfd;
+        argptr = malloc(sizeof(struct proxy_transaction));
+        argptr->request = NULL;
+        argptr->response = NULL;
+        argptr->clientfd = connfd;
+        argptr->serverfd = -1;
+        argptr->bufmaxlen = 256;
+        argptr->bufpos = 0;
+        argptr->buf = malloc(argptr->bufmaxlen);
+
+        // add event to epoll file descriptor
+        ea->data = argptr;
+        event.data.ptr = ea;
+        event.events = EPOLLIN | EPOLLET; // use edge-triggered monitoring
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &event) < 0){
+            fprintf(stderr, "error adding event\n");
+            exit(1);
+        }
+        epoll_cnt++;
     }
 
-    if(strlen(host_header) == 0)                                                //If host header is not set, set it here
-        sprintf(host_header, host_header_format, hostname);
+    if (errno == EWOULDBLOCK || errno == EAGAIN){
+        // no more clients to accept()
+        return 1;
+    } else{
+        perror("error accepting");
+        return 0;
+    }
+} //HERE
 
-    //Build the http header string
-    sprintf(http_header, "%s%s%s%s%s%s%s", request_header, host_header, connection_header,
-                             prox_header, user_agent_hdr, other_headers,
-                             carriage_return);
+int read_all_available(int fd, char **buf_out, size_t *bufmaxlen, size_t *bufpos, int done_after_rnrn)
+{
+    char *buf = *buf_out;
+    int reached_rnrn = 0;
+
+    int read_count;
+    while ((read_count = read(fd, buf + *bufpos, *bufmaxlen - *bufpos - 1)) > 0)
+    {
+        *bufpos += read_count;
+
+        if (*bufpos == *bufmaxlen - 1)
+        {
+            buf = Realloc(buf, *bufmaxlen + 256);
+            *bufmaxlen += 256;
+        }
+
+        if (done_after_rnrn && *bufpos >= 4 && strncmp("\r\n\r\n", buf + *bufpos - 4, 4) == 0)
+        {
+            // The end has been reached!
+            reached_rnrn = 1;
+            break;
+        }
+    }
+
+    *buf_out = buf;
+
+    if (read_count == 0 || reached_rnrn)
+    {
+        buf[*bufpos] = '\0';
+        return *bufpos;
+    }
+    else if (errno == EWOULDBLOCK || errno == EAGAIN)
+    {
+        return -1;
+    }
+    else
+    {
+        return -2;
+    }
+}
+
+size_t parse_first_line(const char *input, struct requestInfo *info)
+{
+    memset(info, 0, sizeof(struct requestInfo));
+    if (strncmp("GET", input, 3) != 0)
+    {
+        info->valid = 0;
+        return -1;
+    }
+
+    const char *uri = input + 3; // skip GET
+
+    while (isspace(*uri))
+    {
+        uri++;
+    }
+
+    if (strncmp("http://", uri, 7) != 0)
+    {
+        info->valid = 0;
+        return -1;
+    }
+
+    const char *host = uri + 7; // skip http://
+    const char *i = host;
+    while (*i != ':' && *i != '/')
+    {
+        i++;
+    }
+
+    const char *endHost = i;
+    if (*i != ':')
+    {
+        info->port = 80;
+    }
+    else
+    {
+        i++;
+        const char *portBegin = i;
+        while (isdigit(*i))
+        {
+            i++;
+        }
+        info->port = atoi(portBegin);
+    }
+    size_t hostLen = endHost - host;
+    info->host = Malloc(hostLen + 1);
+    memcpy(info->host, host, hostLen);
+    info->host[hostLen] = '\0';
+
+    const char *nextSpace = i;
+    while (!isspace(*nextSpace))
+        nextSpace++;
+
+    size_t pathLen = nextSpace - i;
+    info->path = Malloc(pathLen + 1);
+    memcpy(info->path, i, pathLen);
+    info->path[pathLen] = '\0';
+
+    // Ensure protocol matches and eat crlf
+    const char *protocol = nextSpace;
+    while (isspace(*protocol))
+        protocol++;
+
+    if (strncmp("HTTP/1.", protocol, 7) != 0)
+    {
+        info->valid = 0;
+        return -1;
+    }
+    if (protocol[7] != '0' && protocol[7] != '1')
+    {
+        info->valid = 0;
+        return -1;
+    }
+
+    const char *headerBegin = protocol + 10; // Skip HTTP/1.1\r\n
+    info->valid = 1;
+
+    fprintf(LOG, uri);
+    return (size_t)(headerBegin - input);
+}
+
+// This throws away the last part of the string if it doesn't end in \r\n
+// I think any requests should always end in \r\n, but that is an assumption I'm making
+size_t split_headers(char *unsplit, char ***split_out)
+{
+    int arr_size = 10;
+    char **split = Malloc(sizeof(char *) * arr_size);
+    int count = 0;
+    char *begin = unsplit;
+    while ((unsplit = strchr(unsplit, '\r')))
+    {
+        // Not sure if this check is necessary, because
+        // I don't think you can have \r without \n, but
+        // better safe than sorry.
+        if (unsplit[1] == '\n')
+        {
+            // This will make it skip empty lines
+            if (unsplit != begin)
+            {
+
+                unsplit[0] = '\0';
+                if (count == arr_size)
+                {
+                    split = Realloc(split, sizeof(char *) * (arr_size + 10));
+                    arr_size += 10;
+                }
+                split[count] = begin;
+                count++;
+            }
+
+            unsplit += 2;
+            begin = unsplit;
+        }
+    }
+
+    *split_out = split;
+
+    return count;
+}
+
+void on_response_sent(struct event_action *ea)
+{
+    struct proxy_transaction *transaction = (struct proxy_transaction *)ea->data ;
+
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, transaction->clientfd, NULL) < 0)
+    {
+        fprintf(stderr, "error removing event\n");
+        exit(1);
+    }
+    fprintf(LOG, "line %d: deregistered %d (response sent)\n", __LINE__, transaction->clientfd);
+    epoll_cnt--;
+
+    close(transaction->clientfd);
+    close(transaction->serverfd);
+
+    free_proxyTransaction(transaction);
+    ea->data = NULL;
+}
+
+int handle_send_response(struct event_action *ea)
+{
+    struct proxy_transaction *transaction = (struct proxy_transaction *)ea->data ;
+
+    int write_count;
+    while ((write_count = write(transaction->clientfd, transaction->buf + transaction->bufpos, transaction->buflen - transaction->bufpos)) > 0)
+    {
+        transaction->bufpos += write_count;
+    }
+
+    if (write_count == 0)
+    {
+        // Finished writing!  Now do stuff.
+        fprintf(LOG, "Finished writing!\n");
+        on_response_sent(ea);
+        return 0;
+    }
+    else if (errno == EWOULDBLOCK || errno == EAGAIN)
+    {
+        return 1;
+    }
+    else
+    {
+        // An error occured, so clean up nicely.
+        if (epoll_ctl(epfd, EPOLL_CTL_DEL, transaction->clientfd, NULL) < 0)
+        {
+            fprintf(stderr, "error removing event\n");
+            exit(1);
+        }
+        fprintf(LOG, "line %d: deregistered %d (due to error)\n", __LINE__, transaction->clientfd);
+        epoll_cnt--;
+
+        free_proxyTransaction(transaction);
+        ea->data = NULL;
+
+        return 0;
+    }
+}
+
+void on_response_received(struct event_action *ea)
+{
+    struct proxy_transaction *transaction = (struct proxy_transaction *)ea->data ;
+
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, transaction->serverfd, NULL) < 0)
+    {
+        fprintf(stderr, "error removing event\n");
+        exit(1);
+    }
+    fprintf(LOG, "line %d: deregistered %d (response received)\n", __LINE__, transaction->serverfd);
+    epoll_cnt--;
+
+    // add event to epoll file descriptor
+    struct epoll_event event;
+    event.data.ptr = ea;
+    event.events = EPOLLOUT | EPOLLET; // use edge-triggered monitoring
+
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, transaction->clientfd, &event) < 0)
+    {
+        fprintf(stderr, "error adding event\n");
+        exit(1);
+    }
+    fprintf(LOG, "line %d: registered %d\n", __LINE__, transaction->clientfd);
+    epoll_cnt++;
+
+    ea->handler = handle_send_response;
+    ea->fd = transaction->clientfd;
+
+    transaction->bufpos = 0;
+}
+
+int handle_receive_response(struct event_action *ea)
+{
+    fprintf(LOG, "Ready to read from the server!\n");
+    struct proxy_transaction *transaction = (struct proxy_transaction *)ea->data ;
+
+    int len = read_all_available(transaction->serverfd, &transaction->buf, &transaction->bufmaxlen, &transaction->bufpos, 0);
+
+    if (len == -1)
+    {
+        // read_all_available encountered EWOULDBLOCK or EAGAIN
+        return 1;
+    }
+    else if (len == -2)
+    {
+        // Some other error happened....
+        // So close stuff nicely and keep on keepin' on!
+        if (epoll_ctl(epfd, EPOLL_CTL_DEL, transaction->serverfd, NULL) < 0)
+        {
+            fprintf(stderr, "error removing event\n");
+            exit(1);
+        }
+        fprintf(LOG, "line %d: deregistered %d (due to error)\n", __LINE__, transaction->serverfd);
+        epoll_cnt--;
+        return 0;
+    }
+    else
+    {
+        // It finished!
+        fprintf(LOG, "Response received!\n");
+
+        transaction->buflen = len;
+
+        on_response_received(ea);
+        return 1;
+    }
+}
+
+void on_request_sent(struct event_action *ea)
+{
+    struct proxy_transaction *transaction = (struct proxy_transaction *)ea->data ;
+    ea->handler = handle_receive_response;
+
+    // add event to epoll file descriptor
+    struct epoll_event event;
+    event.data.ptr = ea;
+    event.events = EPOLLIN | EPOLLET; // use edge-triggered monitoring
+    ea->fd = transaction->serverfd;
+
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, transaction->serverfd, &event) < 0)
+    {
+        fprintf(stderr, "error modifying event\n");
+        exit(1);
+    }
+    fprintf(LOG, "modified %d\n", transaction->serverfd);
+
+    Free(transaction->buf);
+    transaction->bufmaxlen = 256;
+    transaction->bufpos = 0;
+    transaction->buf = Malloc(transaction->bufmaxlen);
+}
+
+int handle_send_request(struct event_action *ea)
+{
+    struct proxy_transaction *transaction = (struct proxy_transaction *)ea->data ;
+
+    int write_count;
+    while ((write_count = write(transaction->serverfd, transaction->buf + transaction->bufpos, transaction->buflen - transaction->bufpos)) > 0)
+    {
+        transaction->bufpos += write_count;
+    }
+
+    if (write_count == 0)
+    {
+        // Finished writing!  Now do stuff.
+        fprintf(LOG, "Finished writing!\n");
+        on_request_sent(ea);
+        return 1;
+    }
+    else if (errno == EWOULDBLOCK || errno == EAGAIN)
+    {
+        return 1;
+    }
+    else
+    {
+        // An error occured, so clean up nicely.
+        if (epoll_ctl(epfd, EPOLL_CTL_DEL, transaction->serverfd, NULL) < 0)
+        {
+            fprintf(stderr, "error removing event\n");
+            exit(1);
+        }
+        fprintf(LOG, "line %d: deregistered %d (due to error)\n", __LINE__, transaction->serverfd);
+        epoll_cnt--;
+
+        free_proxyTransaction(transaction);
+        ea->data = NULL;
+
+        return 0;
+    }
+}
+
+void prepare_request(char **headers, int header_count, struct requestInfo *req, struct proxy_transaction *transaction)
+{
+    size_t headers_maxlen = 256;
+    char *headers_str = Malloc(headers_maxlen);
+    headers_str[0] = '\0';
+    size_t headers_len = 0;
+
+    int needsHost = 1;
+    for (int i = 0; i < header_count; i++)
+    {
+        if (strncmp("Host", headers[i], 4) == 0)
+        {
+            needsHost = 0;
+        }
+        else if (strncmp("User-Agent", headers[i], 10) == 0 ||
+                 strncmp("Connection", headers[i], 10) == 0 ||
+                 strncmp("Proxy-Connection", headers[i], 16) == 0)
+        {
+            continue;
+        }
+
+        headers_maxlen = headers_len + strlen(headers[i]) + 3;
+        headers_str = Realloc(headers_str, headers_maxlen);
+        strcat(headers_str, headers[i]);
+        strcat(headers_str, "\r\n");
+        headers_len = strlen(headers_str);
+    }
+
+    if (needsHost)
+    {
+        headers_maxlen = headers_len + strlen(req->host) + 9;
+        headers_str = Realloc(headers_str, headers_maxlen);
+        strcat(headers_str, "Host: ");
+        strcat(headers_str, req->host);
+        strcat(headers_str, "\r\n");
+    }
+
+    char *out;
+    int len = asprintf(&out, "GET %s HTTP/1.0\r\n%s\r\nUser-Agent: %s\r\nConnection: close\r\nProxy-Connection: close\r\n\r\n", req->path, headers_str, user_agent_hdr);
+    Free(headers_str);
+
+    Free(transaction->buf);
+    transaction->buflen = len;
+    transaction->bufmaxlen = len;
+    transaction->bufpos = 0;
+    transaction->buf = out;
+}
+
+int on_request_received(struct event_action *ea)
+{
+    struct proxy_transaction *transaction = (struct proxy_transaction *)ea->data ;
+
+    transaction->request = Malloc(sizeof(struct requestInfo));
+    size_t firstLineLength = parse_first_line(transaction->buf, transaction->request);
+    if (firstLineLength == -1 || !transaction->request->valid)
+    {
+        free_requestInfo(transaction->request);
+        transaction->request = NULL;
+        fprintf(stderr, "invalid request\n");
+        return 0;
+    }
+
+    int headerCount = split_headers(transaction->buf + firstLineLength, &transaction->request->headers);
+    prepare_request(transaction->request->headers, headerCount, transaction->request, transaction);
+
+    char *port = Malloc(7);
+    snprintf(port, 6, "%d", transaction->request->port);
+    int fd = open_clientfd(transaction->request->host, port);
+    Free(port);
+
+    if (fd < 0)
+    {
+        fprintf(stderr, "error opening connection to server\n");
+        free_requestInfo(transaction->request);
+        transaction->request = NULL;
+        return 0;
+    }
+
+    if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0)
+    {
+        fprintf(stderr, "error setting socket option\n");
+        exit(1);
+    }
+
+    transaction->serverfd = fd;
+    ea->handler = handle_send_request;
+
+    // add event to epoll file descriptor
+    struct epoll_event event;
+    event.data.ptr = ea;
+    event.events = EPOLLOUT | EPOLLET; // use edge-triggered monitoring
+    ea->fd = transaction->serverfd;
+
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, transaction->serverfd, &event) < 0)
+    {
+        fprintf(stderr, "error adding event\n");
+        exit(1);
+    }
+    fprintf(LOG, "line %d: registered %d\n", __LINE__, transaction->serverfd);
+    epoll_cnt++;
+
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, transaction->clientfd, NULL) < 0)
+    {
+        fprintf(stderr, "error removing event\n");
+        exit(1);
+    }
+    fprintf(LOG, "line %d: deregistered %d (request received)\n", __LINE__, transaction->clientfd);
+    epoll_cnt--;
+
+    return 1;
+}
+
+int handle_receive_request(struct event_action *ea)
+{
+    struct proxy_transaction *transaction = (struct proxy_transaction *)ea->data ;
+    int len = read_all_available(transaction->clientfd, &transaction->buf, &transaction->bufmaxlen, &transaction->bufpos, 1);
+
+    if (len == -1)
+    {
+        // read_all_available encountered EWOULDBLOCK or EAGAIN
+        return 1;
+    }
+    else if (len == -2)
+    {
+        // Some other error happened....
+        // So close stuff nicely and keep on keepin' on!
+        if (epoll_ctl(epfd, EPOLL_CTL_DEL, transaction->clientfd, NULL) < 0)
+        {
+            fprintf(stderr, "error removing event\n");
+            exit(1);
+        }
+        fprintf(LOG, "line %d: deregistered %d (due to error)\n", __LINE__, transaction->clientfd);
+        epoll_cnt--;
+        return 0;
+    }
+    else
+    {
+        // It finished!
+        fprintf(LOG, "Request received!\n");
+
+        transaction->buflen = len;
+
+        int ret = on_request_received(ea);
+        if (ret == 0)
+        {
+            if (epoll_ctl(epfd, EPOLL_CTL_DEL, transaction->clientfd, NULL) < 0)
+            {
+                fprintf(stderr, "error removing event\n");
+                exit(1);
+            }
+            fprintf(LOG, "line %d: deregistered %d (due to invalid request)\n", __LINE__, transaction->clientfd);
+            epoll_cnt--;
+        }
+        return ret;
+    }
 }
 /* $end select */

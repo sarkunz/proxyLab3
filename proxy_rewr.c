@@ -22,6 +22,15 @@ static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64;
 struct sockaddr_in ip4addr;
 int sfd;
 int done = 0;
+cache * head;
+int sizeOfCache;
+
+typedef struct entry {
+    char* key;
+    char* value;
+    int size;
+    struct entry *next;
+} cache;
 
 /////////////////////class code 1////////////////////
 
@@ -77,16 +86,20 @@ int init_socket(int port){
 	return 0;
 }
 
+void init_cache(){
+	//signal(SIGINT, sigint_handler);
+    head = malloc(sizeof(cache));
+	sizeOfCache = 0;
+}
+
 int main( int argc, char *argv[] ) {
   int epfd = epoll_create1( 0 );
 
   int lfd = init_socket( atoi(argv[1]) ); //TODO
 
-  int log_fd = fopen( "logfile", "w" );
-  //can just log directly rather than caching n stuff
+  int log_fd = fopen( "logfile", "w" ); //can just log directly rather than caching n stuff
 
-  initialize_cache( ... ); //TODO
-  // no need to guard access now
+  init_cache(); // no need to guard access now
   
   struct epoll_event evt;
 

@@ -1,148 +1,150 @@
-#include <stddef.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <time.h>
-#include <semaphore.h> 
 #include "cache.h"
+#include <assert.h>
 
-sem_t mutex, w;
-int readcnt = 0;
+#define MAX_CACHE_SIZE 1049000
+#define MAX_OBJECT_SIZE 102400
 
-typedef struct{
-	char* id;
-	time_t last_access;
-	int size;
-	char* data;
-} cache_entry;
 
-cache_entry** cache;
-int max_object_size;
-int max_cache_size;
-int current_cache_size;
-int cache_index;
-
-int delete_oldest_cache(){
-	if (cache_index < 1){
-		return -1;//Cache empty, no delete
-	}
-
-	time_t oldest;
-	time(&oldest);
-	int oldest_index = 0;
-	for (int i = 0; i < cache_index; i++){
-		time_t tm = cache[i]->last_access;
-		if (tm < oldest){
-			oldest = tm;
-			oldest_index = i;
-		}
-	}
-
-	cache_entry* to_delete = cache[oldest_index];
-	free(to_delete);
-	for (int i = oldest_index+1; i < cache_index; i++){
-		cache[i-1] = cache[i];
-	}
-	cache_index--;
-	current_cache_size -= max_object_size;//TODO dynamic size
-	free(cache[cache_index]);
-	cache[cache_index] = NULL;
-	return 0;//Success
+void cache_init(CacheList *list){
+  list->size = 0;
+  list->first = NULL;
+  list->last = NULL;
 }
 
-int get_cache_index(char* id){
-	for (int i = 0; i < cache_index; i++){
-		if (strcmp(cache[i]->id, id) == 0){
-			return i;
-		}
-	}
-	return -1;//Not found
+void cache_URL(char *URL, void *item, size_t size, CacheList *list){
+  //check object size
+  if (size > MAX_OBJECT_SIZE){
+    return;
+  }
+
+  //check space in linked list, evict while necessary
+  while((list->size + size) > MAX_CACHE_SIZE){
+    evict(list);
+  }
+
+  list->size += size;
+
+  CachedItem* cached_item = (CachedItem*) malloc(sizeof(struct CachedItem));
+
+  strcpy(cached_item->url, URL);
+  cached_item->item_p = item;
+  cached_item->size = size;
+
+  //If list is empty, set first and last item in list to item
+  if(list->first == NULL){
+    list->first = cached_item;
+    list->last = cached_item;
+  }
+  else{
+    //Non empty list
+    //reorder so item is first and original first is now next
+    list->first->prev = cached_item;
+    cached_item->next = list->first;
+    cached_item->prev = NULL;
+    list->first = cached_item;
+  }
+
+  return;
 }
 
-/***** Public funtions *****/
+void evict(CacheList *list){
 
-int init_cache(int cache_size, int max_obj_size){
-	max_cache_size = cache_size;
-	max_object_size = max_obj_size;
-	current_cache_size = 0;
-	cache_index = 0;
-	cache = (cache_entry**) malloc(sizeof(cache_entry*)*11); //TODO max_cache_size/max_object_size instead of 11 hardcoded
-	sem_init(&mutex, 0, 1);
-	sem_init(&w, 0, 1);
+  assert(list->size > 0);
+  assert(list->first != NULL);
+  assert(list->last != NULL);
+
+  //if it's last last item the list
+  if(list->last->size == list->size){
+    free(list->last->item_p);
+    free(list->last);
+    list->last = NULL;
+    list->first = NULL;
+    list->size = 0;
+    return;
+  }
+
+  assert(list->last != list->first);
+
+  //Remove any item from list except last item
+  list->last = list->last->prev;
+  list->size -= list->last->next->size;
+  free(list->last->next->item_p);
+  free(list->last->next);
+  list->last->next = NULL;
+  return;
 }
 
-int write_cache(char* id, char* data){
-	if (max_cache_size == NULL || max_object_size == NULL){
-		return -1; //Cache not initialized
-	}
-	//TODO make sure object is not bigger than max set
-	//I think they are already limited by that size in proxy.c
+CachedItem* find(char *URL, CacheList *list){
+  //list is empty, return NULL
 
-	//Create new cache entry
-	cache_entry* new_entry = (cache_entry*) malloc(max_object_size);
-	//strcpy(new_entry->id, id);
-	new_entry->id = id;
-	time_t now;
-	time(&now);
-	new_entry->last_access = now;
-	new_entry->size = max_object_size; //TODO size set to max for now
-	//strncpy(new_entry->data, data, max_object_size);//memcpy?
-	new_entry->data = data;
-	
-	P(&w);
-	if ((current_cache_size + max_object_size) > max_cache_size){
-		delete_oldest_cache();
-	}
-	//Write to next index
-	cache[cache_index] = new_entry;
-	cache_index++;
-	current_cache_size += max_object_size;
-	V(&w);
+  if(list->size > 0){
+    if(strcmp(list->first->url, URL) == 0){
+      return list->first;
+    }
+    //Check if the last item in list is it
+    if(strcmp(list->last->url, URL) == 0){
+      return list->last;
+    }
 
-	return 1; //Successfully written to cache
+    CachedItem* temp = list->first;
+    while(temp->next != NULL){
+      if(strcmp(temp->url, URL) != 0){
+        temp = temp->next;
+      }
+      else{
+        return temp;
+      }
+    }
+  }
+  return NULL;
 }
 
-char* read_cache(char* id){
-	if (max_cache_size == NULL || max_object_size == NULL){
-		return NULL; //Cache not initialized
-	}
+void move_to_front(char *URL, CacheList *list){
+  CachedItem* item = find(URL, list);
+  //Item dne
+  if(item == NULL)
+    return;
 
-	P(&mutex);
-	readcnt++;
-	if (readcnt == 1){
-		P(&w);
-	}
-	V(&mutex);
+  //Check if it's first in list
+  if(item == list->first)
+    return;
 
-	int index = get_cache_index(id);
-	char* data;
-	if (index < 0){//Cache miss
-		data = NULL;
-	}
-	else{//Cache hit
-		time_t now;
-		time(&now);
-		cache[index]->last_access = now;
-		data = cache[index]->data;
-	}
+  //Check if its last in list
+  if(item == list->last){
+    list->last = item->prev;
+    list->first->prev = item;
+    item->next = list->first;
+    item->prev = NULL;
+    list->last->next = NULL;
+    list->first = item;
+    return;
+  }
+  else{
+    //its in the middle
+    item->prev->next = item->next;
+    item->next->prev = item->prev;
+    item->prev = NULL;
+    item->next = list->first;
+    list->first->prev = item;
+    list->first = item;
+    return;
+  }
 
-	P(&mutex);
-	readcnt--;
-	if (readcnt == 0){
-		V(&w);
-	}
-	V(&mutex);
-
-	return data;
 }
 
-void free_cache(){
-	max_cache_size = NULL;
-	max_object_size = NULL;
-	current_cache_size = NULL;
-	cache_index = NULL;
-	free(cache);
-	cache = NULL;
-	sem_destroy(&mutex);
-	sem_destroy(&w);
+void print_URLs(CacheList *list){
+  if(list->size > 0){
+    CachedItem* item = list->first;
+    while(item->next != NULL){
+      printf("%s/n", item->url);
+      item = item->next;
+    }
+    printf("%s\n", item->url);
+  }
 }
+
+void cache_destruct(CacheList *list){
+  while(list->size != 0)
+    evict(list);
+}
+//Free the cache, start at end then go prev and free as you go
